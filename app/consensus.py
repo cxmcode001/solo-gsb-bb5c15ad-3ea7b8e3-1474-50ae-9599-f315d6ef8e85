@@ -19,7 +19,9 @@ Clusters covering at least ``min_replicates`` spectra are reported with
 
 * the consensus m/z: the member m/z average weighted by the *original*
   (request) intensities — the arithmetic mean when every member intensity
-  is zero;
+  is zero (the weights are rescaled by the cluster maximum before
+  accumulation, an equivalent computation that keeps huge finite
+  intensities such as 1e308 from overflowing to a non-finite m/z);
 * the member (spectrum, peak) indices;
 * the median of the base-peak-normalised member intensities, counting
   every spectrum absent from the cluster as 0 (the median runs over all
@@ -139,7 +141,10 @@ def build_consensus_spectrum(
     normalised: list[list[float]] = []
     for peaks in spectra:
         base = max(intensity for _, intensity in peaks)
-        normalised.append([100.0 * intensity / base for _, intensity in peaks])
+        # Divide first, then scale: ``100.0 * intensity`` overflows to inf
+        # for finite intensities above ~1.8e306, while intensity / base is
+        # at most 1.0 by construction, so this order stays finite.
+        normalised.append([intensity / base * 100.0 for _, intensity in peaks])
 
     # Agglomerative cluster state, indexed by cluster id. Singletons are
     # created in global m/z order; merged clusters are appended.
@@ -247,12 +252,20 @@ def build_consensus_spectrum(
         if len(cluster_members) < min_replicates:
             continue
         weights = [spectra[s][p][1] for s, p in cluster_members]
-        total_weight = sum(weights)
-        if total_weight > 0.0:
+        max_weight = max(weights)
+        if max_weight > 0.0:
+            # Rescale the weights into [0, 1] before accumulating: with the
+            # raw intensities both the products mz * weight and the weight
+            # sum itself overflow to inf for very large finite intensities
+            # (e.g. 1e308), yielding a non-finite consensus m/z. Scaling
+            # every weight by the same factor leaves the weighted mean
+            # unchanged, and each scaled product is at most the member m/z.
+            scaled = [weight / max_weight for weight in weights]
+            total_weight = sum(scaled)
             mz = (
                 sum(
                     spectra[s][p][0] * weight
-                    for (s, p), weight in zip(cluster_members, weights)
+                    for (s, p), weight in zip(cluster_members, scaled)
                 )
                 / total_weight
             )

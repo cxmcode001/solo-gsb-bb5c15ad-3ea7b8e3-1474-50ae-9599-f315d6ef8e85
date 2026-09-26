@@ -1,5 +1,7 @@
 """Tests for the replicate consensus-spectrum builder and its API endpoint."""
 
+import math
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -140,6 +142,62 @@ def test_median_counts_missing_spectra_as_zero():
 def test_zero_weight_cluster_falls_back_to_plain_mean():
     spectra = [
         [(100.0, 0.0), (200.0, 5.0)],
+        [(100.001, 0.0), (300.0, 7.0)],
+    ]
+    result = build_consensus_spectrum(spectra, 0.01, 0.0, 2)
+    assert len(result.clusters) == 1
+    cluster = result.clusters[0]
+    assert cluster.mz == pytest.approx(100.0005)
+    assert cluster.intensity == pytest.approx(0.0)
+
+
+def test_huge_intensities_stay_finite():
+    # Regression: 1e308 peaks used to overflow — 100.0 * intensity in the
+    # normalisation and mz * weight (plus the weight sum) in the weighted
+    # mean both became inf, yielding a NaN consensus m/z.
+    spectra = [[(100.0, 1e308)], [(100.001, 1e308)]]
+    result = build_consensus_spectrum(spectra, 0.005, 0.0, 2)
+    assert len(result.clusters) == 1
+    cluster = result.clusters[0]
+    assert math.isfinite(cluster.mz)
+    assert math.isfinite(cluster.intensity)
+    assert cluster.mz == pytest.approx(100.0005)
+    assert cluster.intensity == pytest.approx(100.0)
+    assert _members(cluster) == [(0, 0), (1, 0)]
+
+
+def test_huge_intensity_across_magnitudes():
+    # Weights spanning the full double range: the 1e308 member dominates
+    # the weighted m/z without overflowing the accumulation.
+    spectra = [[(100.0, 1e308)], [(100.001, 1.0)]]
+    result = build_consensus_spectrum(spectra, 0.005, 0.0, 2)
+    assert len(result.clusters) == 1
+    cluster = result.clusters[0]
+    assert math.isfinite(cluster.mz)
+    assert cluster.mz == pytest.approx(100.0, abs=1e-9)
+    # Each spectrum is its own base peak: normalised values [100, 100].
+    assert cluster.intensity == pytest.approx(100.0)
+
+
+def test_zero_and_huge_intensity_members():
+    # A zero-intensity member keeps zero weight next to a 1e308 member.
+    spectra = [
+        [(100.0, 0.0), (200.0, 1e308)],
+        [(100.001, 1e308), (300.0, 1.0)],
+    ]
+    result = build_consensus_spectrum(spectra, 0.005, 0.0, 2)
+    assert len(result.clusters) == 1
+    cluster = result.clusters[0]
+    assert cluster.mz == pytest.approx(100.001)
+    # Normalised member values 0 and 100 -> median 50.
+    assert cluster.intensity == pytest.approx(50.0)
+
+
+def test_all_zero_cluster_with_huge_base_peak_falls_back():
+    # The all-zero plain-mean fallback still applies when the spectrum
+    # base peak is huge (the base peak itself sits in another cluster).
+    spectra = [
+        [(100.0, 0.0), (200.0, 1e308)],
         [(100.001, 0.0), (300.0, 7.0)],
     ]
     result = build_consensus_spectrum(spectra, 0.01, 0.0, 2)
@@ -325,6 +383,29 @@ def test_endpoint_all_zero_spectrum_422(client):
     detail = resp.json()["detail"]
     assert detail["error"] == "zero_spectrum"
     assert detail["spectrum_index"] == 0
+
+
+def test_endpoint_huge_intensities_serialise_finite(client):
+    resp = client.post(
+        "/api/v1/consensus-spectrum",
+        json=_payload([[(100.0, 1e308)], [(100.001, 1e308)]]),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["cluster_count"] == 1
+    cluster = body["clusters"][0]
+    # Finite values only: the raw body must be strict JSON (no Infinity/NaN).
+    assert "Infinity" not in resp.text
+    assert "NaN" not in resp.text
+    assert math.isfinite(cluster["mz"])
+    assert math.isfinite(cluster["intensity"])
+    assert cluster["mz"] == pytest.approx(100.0005, abs=1e-6)
+    assert cluster["intensity"] == pytest.approx(100.0)
+    assert cluster["spectrum_count"] == 2
+    assert cluster["members"] == [
+        {"spectrum_index": 0, "peak_index": 0},
+        {"spectrum_index": 1, "peak_index": 0},
+    ]
 
 
 def test_endpoint_non_finite_values_422(client):
