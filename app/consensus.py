@@ -19,7 +19,11 @@ Clusters covering at least ``min_replicates`` spectra are reported with
 
 * the consensus m/z: the member m/z average weighted by the *original*
   (request) intensities — the arithmetic mean when every member intensity
-  is zero;
+  is zero. Both the per-spectrum normalisation and this weighted average
+  stay finite for legal (finite) inputs even when intensities approach the
+  float maximum: normalisation divides by the base peak first, and the
+  weighted average rescales by its largest weight (and largest m/z) when a
+  direct summation would overflow;
 * the member (spectrum, peak) indices;
 * the median of the base-peak-normalised member intensities, counting
   every spectrum absent from the cluster as 0 (the median runs over all
@@ -31,6 +35,7 @@ sorted by ascending consensus m/z.
 from __future__ import annotations
 
 import heapq
+import math
 from bisect import bisect_left, insort
 from dataclasses import dataclass
 from statistics import median
@@ -90,6 +95,43 @@ class ConsensusResult:
     clusters: tuple[ConsensusCluster, ...]
 
 
+def _weighted_mean(values: list[float], weights: list[float]) -> float:
+    """Weighted mean of ``values`` that stays finite for large weights.
+
+    The direct ``sum(w*v)/sum(w)`` overflows when weights are near the
+    float maximum (e.g. two 1e308 peaks give inf/inf = NaN). When the
+    direct numerator/denominator would not be finite, divide every weight
+    by the largest one and every value by the largest magnitude first;
+    this preserves the same ratios while bounding every summand. All-zero
+    weights fall back to the plain mean.
+    """
+    total_weight = sum(weights)
+    numerator = sum(
+        value * weight for value, weight in zip(values, weights)
+    )
+    if total_weight > 0.0 and math.isfinite(total_weight) and math.isfinite(numerator):
+        return numerator / total_weight
+    if total_weight > 0.0:
+        # Non-finite only via magnitude (all inputs are validated finite):
+        # rescale so each summand is in [-1, 1] and the sums can at most
+        # equal the (bounded) member count.
+        weight_scale = max(weights)
+        value_scale = max(abs(value) for value in values) or 1.0
+        scaled_weights = [weight / weight_scale for weight in weights]
+        scaled_values = [value / value_scale for value in values]
+        # The bracketed ratio is a convex combination of values in [-1, 1],
+        # so multiplying by value_scale afterwards cannot overflow.
+        return value_scale * (
+            sum(
+                value * weight
+                for value, weight in zip(scaled_values, scaled_weights)
+            )
+            / sum(scaled_weights)
+        )
+    # All member intensities are zero: fall back to the plain mean.
+    return sum(values) / len(values)
+
+
 def _validate_spectra(spectra: list[list[tuple[float, float]]]) -> None:
     """Require strictly increasing m/z per spectrum and a positive base peak."""
     for s_idx, peaks in enumerate(spectra):
@@ -139,7 +181,11 @@ def build_consensus_spectrum(
     normalised: list[list[float]] = []
     for peaks in spectra:
         base = max(intensity for _, intensity in peaks)
-        normalised.append([100.0 * intensity / base for _, intensity in peaks])
+        # Form the ratio first: a legal peak intensity may be as large as
+        # ~1.8e308, and ``100.0 * intensity`` would overflow before the
+        # division by the equally large base peak. Since ``intensity/base``
+        # is always in [0, 1], the scaled product stays finite.
+        normalised.append([100.0 * (intensity / base) for _, intensity in peaks])
 
     # Agglomerative cluster state, indexed by cluster id. Singletons are
     # created in global m/z order; merged clusters are appended.
@@ -247,20 +293,8 @@ def build_consensus_spectrum(
         if len(cluster_members) < min_replicates:
             continue
         weights = [spectra[s][p][1] for s, p in cluster_members]
-        total_weight = sum(weights)
-        if total_weight > 0.0:
-            mz = (
-                sum(
-                    spectra[s][p][0] * weight
-                    for (s, p), weight in zip(cluster_members, weights)
-                )
-                / total_weight
-            )
-        else:
-            # All member intensities are zero: fall back to the plain mean.
-            mz = sum(spectra[s][p][0] for s, p in cluster_members) / len(
-                cluster_members
-            )
+        mzs = [spectra[s][p][0] for s, p in cluster_members]
+        mz = _weighted_mean(mzs, weights)
         values = [0.0] * spectrum_count
         for s, p in cluster_members:
             values[s] = normalised[s][p]

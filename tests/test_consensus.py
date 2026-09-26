@@ -1,5 +1,8 @@
 """Tests for the replicate consensus-spectrum builder and its API endpoint."""
 
+import json
+import math
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -147,6 +150,71 @@ def test_zero_weight_cluster_falls_back_to_plain_mean():
     cluster = result.clusters[0]
     assert cluster.mz == pytest.approx(100.0005)
     assert cluster.intensity == pytest.approx(0.0)
+
+
+def test_huge_intensities_stay_finite():
+    # Regression: 100.0 * 1e308 overflows before the base-peak division and
+    # the weighted m/z becomes inf/inf = NaN, so the response can no longer
+    # be serialised. Both normalisation and the weighted average must stay
+    # finite for legal peak intensities near the float maximum.
+    big = 1e308
+    spectra = [
+        [(100.0, big), (100.001, big)],
+        [(100.0, big), (100.001, big)],
+    ]
+    result = build_consensus_spectrum(spectra, 0.01, 0.0, 2)
+    assert len(result.clusters) == 2
+    low, high = result.clusters
+    assert math.isfinite(low.mz) and math.isfinite(low.intensity)
+    assert math.isfinite(high.mz) and math.isfinite(high.intensity)
+    # Equal huge weights: plain m/z values, base-peak-normalised intensity 100.
+    assert low.mz == pytest.approx(100.0)
+    assert high.mz == pytest.approx(100.001)
+    assert low.intensity == pytest.approx(100.0)
+    assert high.intensity == pytest.approx(100.0)
+    assert _members(low) == [(0, 0), (1, 0)]
+    assert _members(high) == [(0, 1), (1, 1)]
+
+
+def test_huge_intensities_with_zero_member_peak():
+    # A zero-intensity member of a spectrum whose base peak is near the
+    # float maximum must normalise to exactly 0, and a cluster mixing the
+    # zero peak with a huge peak stays finite and weighted by the originals.
+    big = 1e308
+    spectra = [
+        [(100.0, 0.0), (200.0, big)],
+        [(100.001, big)],
+    ]
+    result = build_consensus_spectrum(spectra, 0.01, 0.0, 2)
+    assert len(result.clusters) == 1
+    cluster = result.clusters[0]
+    assert math.isfinite(cluster.mz) and math.isfinite(cluster.intensity)
+    # Only the second peak carries weight, so the consensus m/z is its m/z.
+    assert cluster.mz == pytest.approx(100.001)
+    # Normalised values over the two spectra: [0, 100] -> median 50.
+    assert cluster.intensity == pytest.approx(50.0)
+    assert _members(cluster) == [(0, 0), (1, 0)]
+
+
+def test_weights_spanning_orders_of_magnitude():
+    # A 1e308 peak paired with a 1e290 peak: the direct sum of the weights
+    # and of m/z*weight both overflow; the rescaled weighted average must
+    # still honour the tiny 1e-18 relative contribution of the light peak.
+    spectra = [
+        [(100.0, 1e308)],
+        [(100.001, 1e290)],
+    ]
+    result = build_consensus_spectrum(spectra, 0.01, 0.0, 2)
+    assert len(result.clusters) == 1
+    cluster = result.clusters[0]
+    assert math.isfinite(cluster.mz)
+    # Exact reference written in rescaled form (the raw products overflow):
+    # 100 + 0.001 / (1 + 1e18).
+    expected = 100.0 + 0.001 / (1.0 + 1e18)
+    assert cluster.mz == pytest.approx(expected, abs=1e-12)
+    # The 1e-18 contribution is below the 1e-6 reporting precision.
+    assert round(cluster.mz, 6) == 100.0
+    assert math.isfinite(cluster.intensity)
 
 
 def test_identical_mz_across_spectra_merge():
@@ -353,3 +421,39 @@ def test_endpoint_non_finite_values_422(client):
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 422, body
+
+
+def test_endpoint_huge_intensities_serialise_finite(client):
+    # Regression for the 1e308 trigger: non-finite cluster m/z/intensity
+    # used to make response rendering raise ValueError (HTTP 500).
+    big = 1e308
+    resp = client.post(
+        "/api/v1/consensus-spectrum",
+        json=_payload(
+            [
+                [(100.0, big), (100.001, big)],
+                [(100.0, big), (100.001, big)],
+            ]
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["cluster_count"] == 2
+    for cluster in body["clusters"]:
+        assert math.isfinite(cluster["mz"])
+        assert math.isfinite(cluster["intensity"])
+    assert [cluster["mz"] for cluster in body["clusters"]] == [
+        100.0,
+        100.001,
+    ]
+    assert [cluster["intensity"] for cluster in body["clusters"]] == [
+        100.0,
+        100.0,
+    ]
+    # The raw body must be strict JSON, with no Infinity/NaN tokens.
+    assert "Infinity" not in resp.text and "NaN" not in resp.text
+    json.loads(resp.text)
+    assert body["clusters"][0]["members"] == [
+        {"spectrum_index": 0, "peak_index": 0},
+        {"spectrum_index": 1, "peak_index": 0},
+    ]
